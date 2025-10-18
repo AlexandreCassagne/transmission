@@ -517,6 +517,33 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     auto status = std::shared_ptr<int>(new int(TR_LOC_MOVING));
     int volatile* const statusPointer = reinterpret_cast<int volatile*>(status.get());
 
+    NSRect const progressRect = NSMakeRect(0.0, 0.0, 320.0, 110.0);
+    NSPanel* progressPanel = [[NSPanel alloc] initWithContentRect:progressRect
+                                                        styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow)
+                                                          backing:NSBackingStoreBuffered
+                                                            defer:NO];
+    progressPanel.title = NSLocalizedString(@"Moving Data Files", "Move progress panel -> window title");
+    progressPanel.floatingPanel = YES;
+    progressPanel.hidesOnDeactivate = YES;
+
+    NSView* contentView = progressPanel.contentView;
+    progressPanel.contentSize = progressRect.size;
+
+    NSTextField* label = [NSTextField labelWithString:NSLocalizedString(@"Moving data files…", "Move progress panel -> message")];
+    label.alignment = NSTextAlignmentCenter;
+    label.frame = NSMakeRect(20.0, progressRect.size.height - 48.0, progressRect.size.width - 40.0, 20.0);
+    [contentView addSubview:label];
+
+    NSProgressIndicator* indicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect((progressRect.size.width - 32.0) / 2.0, 26.0, 32.0, 32.0)];
+    indicator.style = NSProgressIndicatorSpinningStyle;
+    indicator.controlSize = NSControlSizeRegular;
+    indicator.displayedWhenStopped = NO;
+    [indicator startAnimation:nil];
+    [contentView addSubview:indicator];
+
+    [progressPanel center];
+    [progressPanel orderFront:nil];
+
     dispatch_queue_t const backgroundQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     dispatch_async(backgroundQueue, ^{
         tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, statusPointer);
@@ -526,6 +553,7 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     NSTimeInterval const pollInterval = 0.05;
 
     __block void (^checkStatus)(void);
+    __block NSPanel* activeProgressPanel = progressPanel;
     checkStatus = ^{
         Torrent* strongSelf = weakSelf;
         if (strongSelf == nil)
@@ -538,6 +566,12 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(pollInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), checkStatus);
             return;
+        }
+
+        if (activeProgressPanel != nil)
+        {
+            [activeProgressPanel orderOut:nil];
+            activeProgressPanel = nil;
         }
 
         if (currentStatus == TR_LOC_DONE)
