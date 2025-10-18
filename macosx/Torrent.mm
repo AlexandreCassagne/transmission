@@ -2,6 +2,7 @@
 // It may be used under the MIT (SPDX: MIT) license.
 // License text can be found in the licenses/ folder.
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -95,6 +96,51 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     }
 
     return true;
+}
+
+static uint64_t SumRegularFileSizesAtPath(NSString* path)
+{
+    if (path == nil)
+    {
+        return 0;
+    }
+
+    NSFileManager* fileManager = NSFileManager.defaultManager;
+    BOOL isDirectory = NO;
+    if (![fileManager fileExistsAtPath:path isDirectory:&isDirectory])
+    {
+        return 0;
+    }
+
+    if (!isDirectory)
+    {
+        NSDictionary<NSFileAttributeKey, id>* attributes = [fileManager attributesOfItemAtPath:path error:nil];
+        NSNumber* fileSize = attributes[NSFileSize];
+        return fileSize != nil ? fileSize.unsignedLongLongValue : 0;
+    }
+
+    uint64_t total = 0;
+    NSURL* const rootURL = [NSURL fileURLWithPath:path isDirectory:YES];
+    NSArray<NSURLResourceKey>* const resourceKeys = @[ NSURLIsRegularFileKey, NSURLFileSizeKey ];
+    NSDirectoryEnumerator<NSURL*>* enumerator =
+        [fileManager enumeratorAtURL:rootURL includingPropertiesForKeys:resourceKeys options:0 errorHandler:nil];
+
+    for (NSURL* fileURL in enumerator)
+    {
+        NSNumber* isRegularFile = nil;
+        if (![fileURL getResourceValue:&isRegularFile forKey:NSURLIsRegularFileKey error:nil] || !isRegularFile.boolValue)
+        {
+            continue;
+        }
+
+        NSNumber* fileSize = nil;
+        if ([fileURL getResourceValue:&fileSize forKey:NSURLFileSizeKey error:nil])
+        {
+            total += fileSize.unsignedLongLongValue;
+        }
+    }
+
+    return total;
 }
 
 @implementation Torrent
@@ -517,7 +563,20 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     auto status = std::shared_ptr<int>(new int(TR_LOC_MOVING));
     int volatile* const statusPointer = reinterpret_cast<int volatile*>(status.get());
 
-    NSRect const progressRect = NSMakeRect(0.0, 0.0, 320.0, 110.0);
+    NSString* const torrentName = self.name;
+    NSString* const destinationFolder = [folder copy];
+    NSString* const destinationDataPath = [destinationFolder stringByAppendingPathComponent:torrentName];
+    NSString* const destinationDisplayPath = [destinationDataPath stringByAbbreviatingWithTildeInPath];
+    uint64_t const totalBytesToMove = self.size;
+    NSString* const totalBytesString = [NSString stringForFileSize:totalBytesToMove];
+    NSString* const progressFormat = NSLocalizedString(@"%@ of %@ moved", "Move progress panel -> progress detail format");
+    uint64_t const baselineBytesAtDestination = SumRegularFileSizesAtPath(destinationDataPath);
+    auto progressStringForBytes = ^NSString*(uint64_t movedBytes) {
+        uint64_t const clampedBytes = totalBytesToMove > 0 ? std::min<uint64_t>(movedBytes, totalBytesToMove) : movedBytes;
+        return [NSString stringWithFormat:progressFormat, [NSString stringForFileSize:clampedBytes], totalBytesString];
+    };
+
+    NSRect const progressRect = NSMakeRect(0.0, 0.0, 360.0, 156.0);
     NSPanel* progressPanel = [[NSPanel alloc] initWithContentRect:progressRect
                                                         styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskUtilityWindow)
                                                           backing:NSBackingStoreBuffered
@@ -529,17 +588,46 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     NSView* contentView = progressPanel.contentView;
     progressPanel.contentSize = progressRect.size;
 
-    NSTextField* label = [NSTextField labelWithString:NSLocalizedString(@"Moving data files…", "Move progress panel -> message")];
-    label.alignment = NSTextAlignmentCenter;
-    label.frame = NSMakeRect(20.0, progressRect.size.height - 48.0, progressRect.size.width - 40.0, 20.0);
-    [contentView addSubview:label];
+    CGFloat const padding = 20.0;
+    CGFloat const contentWidth = progressRect.size.width - (2.0 * padding);
 
-    NSProgressIndicator* indicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect((progressRect.size.width - 32.0) / 2.0, 26.0, 32.0, 32.0)];
-    indicator.style = NSProgressIndicatorSpinningStyle;
+    NSTextField* titleLabel = [NSTextField
+        labelWithString:[NSString stringWithFormat:NSLocalizedString(@"Moving “%@”", "Move progress panel -> title"), torrentName]];
+    titleLabel.font = [NSFont boldSystemFontOfSize:NSFont.systemFontSize];
+    titleLabel.frame = NSMakeRect(padding, progressRect.size.height - 44.0, contentWidth, 20.0);
+    titleLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [contentView addSubview:titleLabel];
+
+    NSTextField* destinationLabel = [NSTextField
+        labelWithString:[NSString stringWithFormat:NSLocalizedString(@"Destination: %@", "Move progress panel -> destination"),
+                                                        destinationDisplayPath]];
+    destinationLabel.frame = NSMakeRect(padding, progressRect.size.height - 68.0, contentWidth, 18.0);
+    destinationLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [contentView addSubview:destinationLabel];
+
+    NSProgressIndicator* indicator = [[NSProgressIndicator alloc] initWithFrame:NSMakeRect(padding, 64.0, contentWidth, 20.0)];
+    indicator.style = NSProgressIndicatorBarStyle;
     indicator.controlSize = NSControlSizeRegular;
     indicator.displayedWhenStopped = NO;
-    [indicator startAnimation:nil];
+    indicator.indeterminate = totalBytesToMove == 0;
+    indicator.minValue = 0.0;
+    indicator.maxValue = totalBytesToMove > 0 ? static_cast<double>(totalBytesToMove) : 1.0;
+    indicator.doubleValue = 0.0;
+    if (indicator.isIndeterminate)
+    {
+        [indicator startAnimation:nil];
+    }
     [contentView addSubview:indicator];
+
+    NSTextField* progressDetailLabel = [NSTextField labelWithString:progressStringForBytes(0)];
+    progressDetailLabel.frame = NSMakeRect(padding, 34.0, contentWidth, 20.0);
+    progressDetailLabel.alignment = NSTextAlignmentLeft;
+    progressDetailLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    if (@available(macOS 10.11, *))
+    {
+        progressDetailLabel.font = [NSFont monospacedDigitSystemFontOfSize:NSFont.systemFontSize weight:NSFontWeightRegular];
+    }
+    [contentView addSubview:progressDetailLabel];
 
     [progressPanel center];
     [progressPanel orderFront:nil];
@@ -547,22 +635,97 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     dispatch_queue_t const backgroundQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
     tr_torrent* const torrentHandle = self.fHandle;
     dispatch_async(backgroundQueue, ^{
-        auto statusKeepAlive = status; // keep the relocation flag alive until tr_torrentSetLocation() completes
+        [[maybe_unused]] auto statusKeepAlive = status; // keep the relocation flag alive until tr_torrentSetLocation() completes
         tr_torrentSetLocation(torrentHandle, folder.UTF8String, YES, statusPointer);
     });
 
     __weak Torrent* weakSelf = self;
-    NSTimeInterval const pollInterval = 0.05;
+    NSTimeInterval const pollInterval = 0.2;
 
     __block void (^checkStatus)(void);
     __block __strong NSPanel* activeProgressPanel = progressPanel;
+    __block __strong NSProgressIndicator* activeIndicator = indicator;
+    __block __strong NSTextField* activeProgressDetailLabel = progressDetailLabel;
+    __block BOOL progressComputationScheduled = NO;
+    __block uint64_t latestMeasuredBytes = 0;
+    BOOL const hasKnownTotalSize = totalBytesToMove > 0;
+    double const indicatorMaxValue = hasKnownTotalSize ? static_cast<double>(totalBytesToMove) : 1.0;
+    auto updateProgressLabel = ^(uint64_t movedBytes) {
+        if (activeProgressDetailLabel != nil)
+        {
+            activeProgressDetailLabel.stringValue = progressStringForBytes(movedBytes);
+        }
+    };
     checkStatus = ^{
         [[maybe_unused]] auto const statusGuard = status; // ensure the relocation flag stays alive while polling
         int const currentStatus = *statusPointer;
         if (currentStatus == TR_LOC_MOVING)
         {
+            if (hasKnownTotalSize && !progressComputationScheduled)
+            {
+                progressComputationScheduled = YES;
+                [[maybe_unused]] auto statusKeepAliveForProgress = status;
+                dispatch_async(backgroundQueue, ^{
+                    @autoreleasepool
+                    {
+                        uint64_t const measuredBytes = SumRegularFileSizesAtPath(destinationDataPath);
+                        uint64_t const adjustedBytes = measuredBytes > baselineBytesAtDestination ?
+                            measuredBytes - baselineBytesAtDestination :
+                            0;
+
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            progressComputationScheduled = NO;
+                            if (checkStatus == nil || *statusPointer != TR_LOC_MOVING)
+                            {
+                                return;
+                            }
+
+                            latestMeasuredBytes = adjustedBytes;
+                            if (activeIndicator != nil)
+                            {
+                                BOOL const wasIndeterminate = activeIndicator.isIndeterminate;
+                                activeIndicator.indeterminate = NO;
+                                if (wasIndeterminate)
+                                {
+                                    [activeIndicator stopAnimation:nil];
+                                }
+
+                                activeIndicator.minValue = 0.0;
+                                activeIndicator.maxValue = indicatorMaxValue;
+                                activeIndicator.doubleValue = std::min<double>(adjustedBytes, indicatorMaxValue);
+                            }
+
+                            updateProgressLabel(adjustedBytes);
+                        });
+                    }
+                });
+            }
+
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(pollInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), checkStatus);
             return;
+        }
+
+        if (activeIndicator != nil)
+        {
+            BOOL const wasIndeterminate = activeIndicator.isIndeterminate;
+            activeIndicator.indeterminate = NO;
+            if (wasIndeterminate)
+            {
+                [activeIndicator stopAnimation:nil];
+            }
+
+            activeIndicator.minValue = 0.0;
+            activeIndicator.maxValue = hasKnownTotalSize ? indicatorMaxValue : 1.0;
+            double const finalValue = hasKnownTotalSize ?
+                (currentStatus == TR_LOC_DONE ? indicatorMaxValue : std::min<double>(latestMeasuredBytes, indicatorMaxValue)) :
+                1.0;
+            activeIndicator.doubleValue = finalValue;
+        }
+
+        if (hasKnownTotalSize)
+        {
+            uint64_t const finalBytes = currentStatus == TR_LOC_DONE ? totalBytesToMove : latestMeasuredBytes;
+            updateProgressLabel(finalBytes);
         }
 
         if (activeProgressPanel != nil)
@@ -570,6 +733,9 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
             [activeProgressPanel orderOut:nil];
             activeProgressPanel = nil;
         }
+
+        activeIndicator = nil;
+        activeProgressDetailLabel = nil;
 
         Torrent* strongSelf = weakSelf;
         if (strongSelf == nil)
