@@ -545,23 +545,20 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
     [progressPanel orderFront:nil];
 
     dispatch_queue_t const backgroundQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    tr_torrent* const torrentHandle = self.fHandle;
     dispatch_async(backgroundQueue, ^{
-        tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, statusPointer);
+        auto statusKeepAlive = status; // keep the relocation flag alive until tr_torrentSetLocation() completes
+        tr_torrentSetLocation(torrentHandle, folder.UTF8String, YES, statusPointer);
     });
 
     __weak Torrent* weakSelf = self;
     NSTimeInterval const pollInterval = 0.05;
 
     __block void (^checkStatus)(void);
-    __block NSPanel* activeProgressPanel = progressPanel;
+    __block __strong NSPanel* activeProgressPanel = progressPanel;
     checkStatus = ^{
-        Torrent* strongSelf = weakSelf;
-        if (strongSelf == nil)
-        {
-            return;
-        }
-
-        int const currentStatus = *reinterpret_cast<int volatile*>(status.get());
+        [[maybe_unused]] auto const statusGuard = status; // ensure the relocation flag stays alive while polling
+        int const currentStatus = *statusPointer;
         if (currentStatus == TR_LOC_MOVING)
         {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(pollInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), checkStatus);
@@ -572,6 +569,13 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         {
             [activeProgressPanel orderOut:nil];
             activeProgressPanel = nil;
+        }
+
+        Torrent* strongSelf = weakSelf;
+        if (strongSelf == nil)
+        {
+            checkStatus = nil;
+            return;
         }
 
         if (currentStatus == TR_LOC_DONE)
