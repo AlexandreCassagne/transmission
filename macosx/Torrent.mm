@@ -2,6 +2,7 @@
 // It may be used under the MIT (SPDX: MIT) license.
 // License text can be found in the licenses/ folder.
 
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -513,30 +514,52 @@ bool trashDataFile(char const* filename, void* /*user_data*/, tr_error* error)
         return;
     }
 
-    int volatile status;
-    tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, &status);
+    auto status = std::shared_ptr<int>(new int(TR_LOC_MOVING));
+    int volatile* const statusPointer = reinterpret_cast<int volatile*>(status.get());
 
-    while (status == TR_LOC_MOVING) //block while moving (for now)
-    {
-        [NSThread sleepForTimeInterval:0.05];
-    }
+    dispatch_queue_t const backgroundQueue = dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0);
+    dispatch_async(backgroundQueue, ^{
+        tr_torrentSetLocation(self.fHandle, folder.UTF8String, YES, statusPointer);
+    });
 
-    if (status == TR_LOC_DONE)
-    {
-        [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateStats" object:nil];
-    }
-    else
-    {
-        NSAlert* alert = [[NSAlert alloc] init];
-        alert.messageText = NSLocalizedString(@"There was an error moving the data file.", "Move error alert -> title");
-        alert.informativeText = [NSString
-            stringWithFormat:NSLocalizedString(@"The move operation of \"%@\" cannot be done.", "Move error alert -> message"), self.name];
-        [alert addButtonWithTitle:NSLocalizedString(@"OK", "Move error alert -> button")];
+    __weak Torrent* weakSelf = self;
+    NSTimeInterval const pollInterval = 0.05;
 
-        [alert runModal];
-    }
+    __block void (^checkStatus)(void);
+    checkStatus = ^{
+        Torrent* strongSelf = weakSelf;
+        if (strongSelf == nil)
+        {
+            return;
+        }
 
-    [self updateTimeMachineExclude];
+        int const currentStatus = *reinterpret_cast<int volatile*>(status.get());
+        if (currentStatus == TR_LOC_MOVING)
+        {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(pollInterval * NSEC_PER_SEC)), dispatch_get_main_queue(), checkStatus);
+            return;
+        }
+
+        if (currentStatus == TR_LOC_DONE)
+        {
+            [NSNotificationCenter.defaultCenter postNotificationName:@"UpdateStats" object:nil];
+        }
+        else
+        {
+            NSAlert* alert = [[NSAlert alloc] init];
+            alert.messageText = NSLocalizedString(@"There was an error moving the data file.", "Move error alert -> title");
+            alert.informativeText = [NSString
+                stringWithFormat:NSLocalizedString(@"The move operation of \"%@\" cannot be done.", "Move error alert -> message"), strongSelf.name];
+            [alert addButtonWithTitle:NSLocalizedString(@"OK", "Move error alert -> button")];
+
+            [alert runModal];
+        }
+
+        [strongSelf updateTimeMachineExclude];
+        checkStatus = nil;
+    };
+
+    checkStatus();
 }
 
 - (void)copyTorrentFileTo:(NSString*)path
