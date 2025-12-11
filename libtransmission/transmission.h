@@ -909,7 +909,8 @@ enum : uint8_t
 {
     TR_LOC_MOVING,
     TR_LOC_DONE,
-    TR_LOC_ERROR
+    TR_LOC_ERROR,
+    TR_LOC_CANCELED
 };
 
 /**
