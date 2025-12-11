@@ -15,6 +15,8 @@
 #include <libtransmission/log.h>
 #include <libtransmission/utils.h>
 
+#import <objc/runtime.h>
+
 #import "Torrent.h"
 #import "GroupsController.h"
 #import "FileListNode.h"
@@ -57,6 +59,8 @@ static dispatch_queue_t timeMachineExcludeQueue;
 
 @property(nonatomic, readonly) BOOL shouldShowEta;
 @property(nonatomic, readonly) NSString* etaString;
+
+- (void)tr_invokeButtonHandler:(NSButton*)sender;
 
 @end
 
@@ -143,6 +147,8 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
     return total;
 }
 
+static char const* kTorrentMoveCancelHandlerKey = "TorrentMoveCancelHandlerKey";
+
 @implementation Torrent
 
 + (void)initialize
@@ -172,6 +178,15 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
         }
     }
     return self;
+}
+
+- (void)tr_invokeButtonHandler:(NSButton*)sender
+{
+    dispatch_block_t handler = (__bridge dispatch_block_t)objc_getAssociatedObject(sender, &kTorrentMoveCancelHandlerKey);
+    if (handler != nil)
+    {
+        handler();
+    }
 }
 
 - (instancetype)initWithTorrentStruct:(tr_torrent*)torrentStruct location:(NSString*)location lib:(tr_session*)lib
@@ -570,6 +585,8 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
     uint64_t const totalBytesToMove = self.size;
     NSString* const totalBytesString = [NSString stringForFileSize:totalBytesToMove];
     NSString* const progressFormat = NSLocalizedString(@"%@ of %@ moved", "Move progress panel -> progress detail format");
+    NSString* const cancelProgressText = NSLocalizedString(@"Cancelling…", "Move progress panel -> cancel detail text");
+    NSString* const cancelButtonTitle = NSLocalizedString(@"Cancel Move", "Move progress panel -> cancel button title");
     uint64_t const baselineBytesAtDestination = SumRegularFileSizesAtPath(destinationDataPath);
     auto progressStringForBytes = ^NSString*(uint64_t movedBytes) {
         uint64_t const clampedBytes = totalBytesToMove > 0 ? std::min<uint64_t>(movedBytes, totalBytesToMove) : movedBytes;
@@ -629,6 +646,12 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
     }
     [contentView addSubview:progressDetailLabel];
 
+    CGFloat const cancelButtonWidth = 112.0;
+    NSButton* cancelButton = [NSButton buttonWithTitle:cancelButtonTitle target:nil action:NULL];
+    cancelButton.frame = NSMakeRect(progressRect.size.width - padding - cancelButtonWidth, 6.0, cancelButtonWidth, 28.0);
+    cancelButton.bezelStyle = NSBezelStyleRounded;
+    [contentView addSubview:cancelButton];
+
     [progressPanel center];
     [progressPanel orderFront:nil];
 
@@ -646,8 +669,10 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
     __block __strong NSPanel* activeProgressPanel = progressPanel;
     __block __strong NSProgressIndicator* activeIndicator = indicator;
     __block __strong NSTextField* activeProgressDetailLabel = progressDetailLabel;
+    __block __strong NSButton* activeCancelButton = cancelButton;
     __block BOOL progressComputationScheduled = NO;
     __block uint64_t latestMeasuredBytes = 0;
+    __block BOOL cancelRequested = NO;
     BOOL const hasKnownTotalSize = totalBytesToMove > 0;
     double const indicatorMaxValue = hasKnownTotalSize ? static_cast<double>(totalBytesToMove) : 1.0;
     auto updateProgressLabel = ^(uint64_t movedBytes) {
@@ -656,11 +681,48 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
             activeProgressDetailLabel.stringValue = progressStringForBytes(movedBytes);
         }
     };
+    dispatch_block_t requestCancel = ^{
+        if (statusPointer == nullptr || *statusPointer != TR_LOC_MOVING)
+        {
+            return;
+        }
+
+        cancelRequested = YES;
+        if (statusPointer != nullptr)
+        {
+            *statusPointer = TR_LOC_CANCELED;
+        }
+
+        if (activeIndicator != nil)
+        {
+            activeIndicator.indeterminate = YES;
+            [activeIndicator startAnimation:nil];
+        }
+
+        if (activeProgressDetailLabel != nil)
+        {
+            activeProgressDetailLabel.stringValue = cancelProgressText;
+        }
+
+        if (activeCancelButton != nil)
+        {
+            activeCancelButton.enabled = NO;
+        }
+    };
+
+    objc_setAssociatedObject(cancelButton, &kTorrentMoveCancelHandlerKey, requestCancel, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    cancelButton.target = self;
+    cancelButton.action = @selector(tr_invokeButtonHandler:);
     checkStatus = ^{
         [[maybe_unused]] auto const statusGuard = status; // ensure the relocation flag stays alive while polling
         int const currentStatus = *statusPointer;
         if (currentStatus == TR_LOC_MOVING)
         {
+            if (cancelRequested && activeProgressDetailLabel != nil)
+            {
+                activeProgressDetailLabel.stringValue = cancelProgressText;
+            }
+
             if (hasKnownTotalSize && !progressComputationScheduled)
             {
                 progressComputationScheduled = YES;
@@ -705,6 +767,33 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
             return;
         }
 
+        if (currentStatus == TR_LOC_CANCELED)
+        {
+            if (activeProgressPanel != nil)
+            {
+                [activeProgressPanel orderOut:nil];
+                activeProgressPanel = nil;
+            }
+
+            activeIndicator = nil;
+            activeProgressDetailLabel = nil;
+            activeCancelButton = nil;
+
+            Torrent* strongSelf = weakSelf;
+            if (strongSelf != nil)
+            {
+                NSAlert* alert = [[NSAlert alloc] init];
+                alert.messageText = NSLocalizedString(@"Move Cancelled", "Move cancel alert -> title");
+                alert.informativeText = [NSString stringWithFormat:NSLocalizedString(@"The move of \"%@\" was cancelled. Files may be partially copied.", "Move cancel alert -> message"), strongSelf.name];
+                [alert addButtonWithTitle:NSLocalizedString(@"OK", "Move cancel alert -> button")];
+
+                [alert runModal];
+            }
+
+            checkStatus = nil;
+            return;
+        }
+
         if (activeIndicator != nil)
         {
             BOOL const wasIndeterminate = activeIndicator.isIndeterminate;
@@ -736,6 +825,7 @@ static uint64_t SumRegularFileSizesAtPath(NSString* path)
 
         activeIndicator = nil;
         activeProgressDetailLabel = nil;
+        activeCancelButton = nil;
 
         Torrent* strongSelf = weakSelf;
         if (strongSelf == nil)

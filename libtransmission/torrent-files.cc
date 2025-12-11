@@ -160,7 +160,8 @@ bool tr_torrent_files::move(
     std::string_view old_parent_in,
     std::string_view parent_in,
     std::string_view parent_name,
-    tr_error* error) const
+    tr_error* error,
+    int volatile* relocate_state) const
 {
     auto const old_parent = tr_pathbuf{ old_parent_in };
     auto const parent = tr_pathbuf{ parent_in };
@@ -179,9 +180,22 @@ bool tr_torrent_files::move(
     auto const paths = std::array<std::string_view, 1>{ old_parent.sv() };
 
     auto err = bool{};
+    auto canceled = bool{};
+
+    auto const canceled_requested = [relocate_state]()
+    {
+        return relocate_state != nullptr && *relocate_state == TR_LOC_CANCELED;
+    };
 
     for (tr_file_index_t i = 0, n = file_count(); i < n; ++i)
     {
+        if (canceled_requested())
+        {
+            canceled = true;
+            err = true;
+            break;
+        }
+
         auto const found = find(i, std::data(paths), std::size(paths));
         if (!found)
         {
@@ -206,7 +220,7 @@ bool tr_torrent_files::move(
     }
 
     // after moving the files, remove any leftover empty directories
-    if (!err)
+    if (!err && !canceled)
     {
         auto const remove_empty_directories = [](char const* filename)
         {

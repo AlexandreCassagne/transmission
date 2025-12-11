@@ -1087,9 +1087,11 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
     TR_ASSERT(session->am_in_session_thread());
 
     auto ok = true;
+    bool canceled = setme_state != nullptr && *setme_state == TR_LOC_CANCELED;
+
     if (move_from_old_path)
     {
-        if (setme_state != nullptr)
+        if (setme_state != nullptr && !canceled)
         {
             *setme_state = TR_LOC_MOVING;
         }
@@ -1099,7 +1101,9 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
         session->verify_remove(this);
 
         auto error = tr_error{};
-        ok = files().move(current_dir(), path, name(), &error);
+        ok = !canceled && files().move(current_dir(), path, name(), &error, setme_state);
+        canceled = canceled || (setme_state != nullptr && *setme_state == TR_LOC_CANCELED);
+        ok = ok && !canceled;
         if (error)
         {
             this->error().set_local_error(fmt::format(
@@ -1126,7 +1130,14 @@ void tr_torrent::set_location_in_session_thread(std::string_view const path, boo
 
     if (setme_state != nullptr)
     {
-        *setme_state = ok ? TR_LOC_DONE : TR_LOC_ERROR;
+        if (canceled)
+        {
+            *setme_state = TR_LOC_CANCELED;
+        }
+        else
+        {
+            *setme_state = ok ? TR_LOC_DONE : TR_LOC_ERROR;
+        }
     }
 }
 
